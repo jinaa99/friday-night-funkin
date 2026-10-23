@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="mn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>FNF Practice</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1b1f2a; overflow: hidden; touch-action: none; user-select: none; -webkit-user-select: none; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const CFG = {
+  duration: 60000,     // тоглолтын урт (ms)
+  speed: 0.2,          // сумны хурд (px / ms) — маш удаан
+  lateWindow: 110,     // сум өнгөрснөөс хойш хэдэн ms дотор дарж болох
+  sweepGap: 200,       // 4 өөр сумыг дараалан дарах үеийн зай (ms) — хурдан дарна
+};
+
+// Сум зүүн, доош, дээш, баруун — дээш заасан сумыг эргүүлж зурна
+const LANES = [
+  { angle: -Math.PI / 2, color: '#ffd23f' },
+  { angle: Math.PI,      color: '#3fc8ff' },
+  { angle: 0,            color: '#ff3b4f' },
+  { angle: Math.PI / 2,  color: '#8ee04a' },
+];
+const KEYS = {
+  ArrowLeft: 0,
+  ArrowDown: 1,
+  ArrowUp: 2,
+  ArrowRight: 3,
+};
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W, H, size, laneX, recY;
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  size = Math.min(80, W / 4.8);
+  const gap = size * 1.25;
+  const left = W / 2 - gap * 1.5;
+  laneX = LANES.map((_, i) => left + gap * i);
+  recY = 40 + size * 0.75;
+}
+window.addEventListener('resize', resize);
+resize();
+
+let state = 'menu';   // menu | play | fail | clear
+let notes = [];
+let startAt = 0, songTime = 0, failReason = '';
+let combo = 0, best = 0;
+const pressed = [false, false, false, false];
+const flash = [0, 0, 0, 0];
+let popup = null;
+
+const rand = n => Math.floor(Math.random() * n);
+
+function makeChart() {
+  const out = [];
+  // Нэг замд дараалсан сумнууд давхцахгүй байх хамгийн бага зай
+  const laneGap = Math.ceil(size * 1.15 / CFG.speed);
+  let t = 2000, prev = -1;
+  while (t < CFG.duration - 1500) {
+    const r = Math.random();
+    if (r < 0.25) {
+      // 4 сум тус бүрийг нэг нэгээр, санамсаргүй дарааллаар
+      const order = [0, 1, 2, 3].sort(() => Math.random() - 0.5);
+      order.forEach((lane, i) => out.push({ t: t + i * CFG.sweepGap, lane, done: false }));
+      t += 3 * CFG.sweepGap;
+      prev = order[3];
+    } else {
+      let lane;
+      do lane = rand(4); while (lane === prev);
+      prev = lane;
+      const count = r < 0.75 ? 1 : 2 + rand(2);   // ихэвчлэн 1, заримдаа 2–3
+      for (let i = 0; i < count; i++) out.push({ t: t + i * laneGap, lane, done: false });
+      t += (count - 1) * laneGap;
+    }
+    t += 600 + Math.random() * 400;
+  }
+  return out;
+}
+
+function startGame() {
+  notes = makeChart();
+  startAt = performance.now();
+  songTime = 0;
+  combo = 0;
+  popup = null;
+  state = 'play';
+}
+
+function fail(reason) {
+  state = 'fail';
+  failReason = reason;
+  best = Math.max(best, combo);
+}
+
+function press(lane) {
+  pressed[lane] = true;
+  if (state !== 'play') return;
+  songTime = performance.now() - startAt;
+  // Сум саарал сумтай давхцаж эхэлмэгц эрт дарсан ч ононо
+  const early = earlyWindow();
+  let target = null, bestDiff = Infinity;
+  for (const n of notes) {
+    if (n.done || n.lane !== lane) continue;
+    const off = n.t - songTime;   // + бол эрт, - бол хоцорсон
+    if (off <= early && off >= -CFG.lateWindow && Math.abs(off) < bestDiff) { target = n; bestDiff = Math.abs(off); }
+    if (off > early) break;
+  }
+  if (!target) return;   // ghost tapping: сумгүй үед дарахад алдаа болохгүй
+  target.done = true;
+  combo++;
+  flash[lane] = performance.now();
+  playDon(lane);
+  const rating = bestDiff <= 45 ? 'SICK!!' : bestDiff <= 90 ? 'GOOD' : bestDiff <= 135 ? 'BAD' : 'SHIT';
+  popup = { text: rating, at: performance.now() };
+}
+
+function earlyWindow() { return Math.max(CFG.lateWindow, size * 0.8 / CFG.speed); }
+
+function release(lane) { pressed[lane] = false; }
+
+// "Дон" гэсэн бөмбөрийн дуу — Web Audio-оор үүсгэнэ
+let audio = null;
+function initAudio() {
+  if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
+  if (audio.state === 'suspended') audio.resume();
+}
+// Сум бүр ижил төстэй ч бага зэрэг өөр өндөртэй (← ↓ ↑ →)
+const DON_PITCH = [1, 0.85, 1.2, 1.4];
+function playDon(lane) {
+  if (!audio) return;
+  const t = audio.currentTime;
+  const osc = audio.createOscillator();
+  const gain = audio.createGain();
+  osc.type = 'sine';
+  const k = DON_PITCH[lane];
+  osc.frequency.setValueAtTime(220 * k, t);
+  osc.frequency.exponentialRampToValueAtTime(70 * k, t + 0.15);
+  gain.gain.setValueAtTime(0.9, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + 0.25);
+  osc.connect(gain).connect(audio.destination);
+  osc.start(t);
+  osc.stop(t + 0.26);
+}
+
+window.addEventListener('keydown', e => {
+  if (e.code === 'Enter' || e.code === 'NumpadEnter') {
+    initAudio();
+    if (state !== 'play') startGame();
+    e.preventDefault();
+    return;
+  }
+  const lane = KEYS[e.code];
+  if (lane === undefined) return;
+  e.preventDefault();
+  if (!e.repeat) press(lane);
+});
+window.addEventListener('keyup', e => {
+  const lane = KEYS[e.code];
+  if (lane !== undefined) release(lane);
+});
+
+// Таб солиход цаг үсрэхгүйн тулд эхнээс нь эхлүүлнэ
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && state === 'play') fail('Тоглоом зогслоо');
+});
+
+function drawArrow(x, y, s, angle, color, glow) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(angle);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(0, s * 0.4);
+  ctx.lineTo(0, -s * 0.36);
+  ctx.moveTo(-s * 0.36, -s * 0.02);
+  ctx.lineTo(0, -s * 0.38);
+  ctx.lineTo(s * 0.36, -s * 0.02);
+  ctx.strokeStyle = 'rgba(0,0,0,0.45)';
+  ctx.lineWidth = s * 0.27;
+  ctx.stroke();
+  if (glow) { ctx.shadowColor = color; ctx.shadowBlur = s * 0.35; }
+  ctx.strokeStyle = color;
+  ctx.lineWidth = s * 0.17;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function text(str, x, y, px, color = '#fff', weight = 800) {
+  ctx.font = `${weight} ${px}px system-ui, -apple-system, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = px * 0.18;
+  ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+  ctx.strokeText(str, x, y);
+  ctx.fillStyle = color;
+  ctx.fillText(str, x, y);
+}
+
+function draw(now) {
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#2a3040');
+  bg.addColorStop(1, '#151820');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // Замын арын хэсэг
+  ctx.fillStyle = 'rgba(0,0,0,0.22)';
+  ctx.fillRect(laneX[0] - size * 0.7, 0, laneX[3] - laneX[0] + size * 1.4, H);
+
+  // Дээрх саарал сумнууд
+  LANES.forEach((l, i) => {
+    const hitAge = now - flash[i];
+    const hit = hitAge < 140;
+    const s = size * (pressed[i] ? 0.9 : 1);
+    drawArrow(laneX[i], recY, s, l.angle, hit ? l.color : pressed[i] ? '#8a909c' : '#5d626d', hit);
+  });
+
+  // Доороос дээш гарч ирэх сумнууд
+  for (const n of notes) {
+    if (n.done) continue;
+    const y = recY + (n.t - songTime) * CFG.speed;
+    if (y > H + size) break;
+    if (y < -size) continue;
+    drawArrow(laneX[n.lane], y, size, LANES[n.lane].angle, LANES[n.lane].color, true);
+  }
+
+  // Явц
+  const p = Math.min(1, songTime / CFG.duration);
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  ctx.fillRect(0, 0, W, 6);
+  ctx.fillStyle = '#8ee04a';
+  ctx.fillRect(0, 0, W * p, 6);
+
+  if (state === 'play' || state === 'fail') {
+    const left = Math.max(0, Math.ceil((CFG.duration - songTime) / 1000));
+    text(`${left}s`, W - 34, 26, 16, '#cfd3dc', 700);
+    if (combo > 0) text(`${combo}`, W / 2, H * 0.62, 44);
+    if (popup && now - popup.at < 450) {
+      const k = (now - popup.at) / 450;
+      ctx.globalAlpha = 1 - k;
+      text(popup.text, W / 2, H * 0.55 - k * 20, 30, { 'SICK!!': '#7df3ff', GOOD: '#8ee04a', BAD: '#ffb03f', SHIT: '#ff5a5a' }[popup.text]);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  if (state !== 'play') {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, W, H);
+  }
+  const cy = H / 2;
+  if (state === 'menu') {
+    text('FNF PRACTICE', W / 2, cy - 60, 40);
+    text('← ↓ ↑ →', W / 2, cy, 20, '#cfd3dc', 600);
+    text('Нэг ч сум алгасвал эхнээс нь эхэлнэ', W / 2, cy + 32, 15, '#9aa0ac', 500);
+    text('Enter дарж эхлэх', W / 2, cy + 80, 20, '#ffd23f');
+  } else if (state === 'fail') {
+    text('Алдлаа', W / 2, cy - 30, 28, '#fff', 600);
+    text(`${failReason} · Combo: ${combo} · Шилдэг: ${best}`, W / 2, cy + 6, 15, '#9aa0ac', 500);
+    text('Enter дарж дахин эхлэх', W / 2, cy + 40, 16, '#ffd23f', 500);
+  } else if (state === 'clear') {
+    text('АМЖИЛТТАЙ!', W / 2, cy - 50, 48, '#8ee04a');
+    text(`${notes.length} сум бүгдийг онолоо`, W / 2, cy, 20, '#cfd3dc', 600);
+    text('Enter дарж дахин тоглох', W / 2, cy + 60, 20, '#ffd23f');
+  }
+}
+
+function frame(now) {
+  if (state === 'play') {
+    songTime = now - startAt;
+    for (const n of notes) {
+      if (n.done) continue;
+      if (songTime - n.t > CFG.lateWindow) { fail('Сум алгаслаа'); break; }
+      break;
+    }
+    if (state === 'play' && songTime >= CFG.duration) {
+      best = Math.max(best, combo);
+      state = 'clear';
+    }
+  }
+  draw(now);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
