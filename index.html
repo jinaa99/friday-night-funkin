@@ -82,7 +82,7 @@ function makeChart() {
       for (let i = 0; i < count; i++) out.push({ t: t + i * laneGap, lane, done: false });
       t += (count - 1) * laneGap;
     }
-    t += 600 + Math.random() * 400;
+    t += 300 + Math.random() * 300;   // хэв маяг хоорондын зай
   }
   return out;
 }
